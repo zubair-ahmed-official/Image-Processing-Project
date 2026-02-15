@@ -2,11 +2,11 @@ import cv2
 from face_detection import detect_faces
 from emotion_predictor import predict_emotion
 from voice import say_hello
+from person_tracker import is_new_person
 
 cap = cv2.VideoCapture(0)
 
-human_present = False
-hello_display = False
+hello_text_frames = 0  # show "Hello!" for a short time
 
 while True:
     ret, frame = cap.read()
@@ -15,26 +15,17 @@ while True:
 
     faces = detect_faces(frame)
 
-    # If new human arrives
-    if len(faces) > 0 and not human_present:
+    # ✅ Detect new person using MediaPipe signature
+    if len(faces) > 0 and is_new_person(frame):
         say_hello()
-        human_present = True
-        hello_display = True
-
-    # If no human anymore
-    if len(faces) == 0:
-        human_present = False
-        hello_display = False
+        hello_text_frames = 30  # show text for ~30 frames
 
     for (x, y, w, h) in faces:
         face_img = frame[y:y+h, x:x+w]
-
         emotion, confidence = predict_emotion(face_img)
 
-        # Draw face box
         cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
 
-        # Show emotion
         cv2.putText(
             frame,
             f"{emotion} ({confidence:.2f})",
@@ -45,8 +36,7 @@ while True:
             2
         )
 
-        # Show Hello text
-        if hello_display:
+        if hello_text_frames > 0:
             cv2.putText(
                 frame,
                 "Hello!",
@@ -57,7 +47,10 @@ while True:
                 3
             )
 
-    cv2.imshow("Emotion + Voice AI", frame)
+    if hello_text_frames > 0:
+        hello_text_frames -= 1
+
+    cv2.imshow("Emotion + New Person Greeting", frame)
 
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break

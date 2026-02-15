@@ -2,27 +2,22 @@ import pyttsx3
 import time
 
 engine = pyttsx3.init()
-
-# 🔹 Set speaking speed
 engine.setProperty("rate", 160)
 
-# 🔹 Select female voice
+# choose female voice if available (Windows often has Zira)
 voices = engine.getProperty("voices")
-
-for voice in voices:
-    # Many Windows female voices contain "female" or specific names like "Zira"
-    if "female" in voice.name.lower() or "zira" in voice.name.lower():
-        engine.setProperty("voice", voice.id)
+for v in voices:
+    if "zira" in v.name.lower() or "female" in v.name.lower():
+        engine.setProperty("voice", v.id)
         break
 
-last_spoken_time = 0
+_last_spoken = 0
 COOLDOWN = 4  # seconds
 
 def say_hello():
-    global last_spoken_time
+    global _last_spoken
     now = time.time()
-
-    if now - last_spoken_time > COOLDOWN:
+    if now - _last_spoken >= COOLDOWN:
         engine.say("Hello")
         engine.runAndWait()
-        last_spoken_time = now
+        _last_spoken = now
