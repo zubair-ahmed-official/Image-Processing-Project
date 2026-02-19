@@ -34,7 +34,7 @@ def _worker():
         if text is None:
             break
         try:
-            _voice.Speak(text)  # blocking speak (safe in worker)
+            _voice.Speak(str(text))  # blocking speak (safe in worker)
         except Exception as e:
             print("SAPI TTS error:", e)
         time.sleep(0.05)
@@ -46,6 +46,12 @@ def start_voice_worker():
     _worker_started = True
     threading.Thread(target=_worker, daemon=True).start()
 
-def say_hello():
+# ✅ NEW: speak any text (emotion responses etc.)
+def say_text(text: str):
     start_voice_worker()
-    _q.put("Hello")
+    if text and isinstance(text, str):
+        _q.put(text)
+
+# ✅ Keep hello (uses say_text internally)
+def say_hello():
+    say_text("Hello")
