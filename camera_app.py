@@ -1,24 +1,45 @@
 import cv2
 import time
+import threading
+import speech_recognition as sr
+
 from face_detection import detect_faces
 from emotion_predictor import predict_emotion
 from person_tracker import should_greet
 from voice import start_voice_worker, say_hello, say_text
 from attention_mode import AttentionMode
-from multi_customer_selector import MultiCustomerSelector
 
 start_voice_worker()
 cap = cv2.VideoCapture(0)
 
-# --- overlays ---
+# -----------------------------
+# overlays
+# -----------------------------
 hello_text_frames = 0
 attention_text_frames = 0
 instruction_frames = 0
 
-# --- selection / multi-customer ---
-selector = MultiCustomerSelector(hold_seconds=10.0)
+# -----------------------------
+# conversation / selection state
+# -----------------------------
+selected_idx = None
+selected_until = 0.0
+SELECTION_HOLD_SEC = 15
 
-# --- emotion speech tuning ---
+conversation_active = False
+
+# prompt cooldown
+last_multi_prompt_time = 0.0
+MULTI_PROMPT_COOLDOWN_SEC = 8
+
+# -----------------------------
+# wake word detection
+# -----------------------------
+wake_word_detected = False
+
+# -----------------------------
+# emotion speech tuning
+# -----------------------------
 EMOTION_MIN_CONF = 0.55
 EMOTION_STABLE_FRAMES = 6
 EMOTION_COOLDOWN_SEC = 10
@@ -28,25 +49,38 @@ _stable_emotion_count = 0
 _last_emotion_spoken_time = 0.0
 _last_emotion_spoken_label = None
 
+# greeting cooldown
+last_hello_time = 0.0
+HELLO_COOLDOWN_SEC = 8
+
+
 def get_emotion_sentence(emotion: str):
     if not emotion:
         return None
+
     e = emotion.lower()
+
     if "happy" in e:
         return "You look happy today! Glad to see you happy!"
+
     if "sad" in e:
         return "You look a bit sad. I hope everything is okay."
+
     if "angry" in e:
         return "You seem angry. Take a deep breath. I'm here if you need a moment."
+
     if "surprise" in e:
         return "You look surprised! Something interesting happened?"
+
     if "fear" in e:
         return "You look worried. It's okay. Take your time."
-    if "neutral" in e:
-        return None
+
     return None
 
-# Attention mode controller
+
+# -----------------------------
+# Attention Mode
+# -----------------------------
 attention = AttentionMode(
     seconds_required=1.6,
     center_radius_ratio=0.22,
@@ -54,74 +88,152 @@ attention = AttentionMode(
     speak_cooldown_sec=12
 )
 
-# To avoid talking to the wrong person when switching selection
-_selected_last_idx = None
 
+# -----------------------------
+# Wake word listener thread
+# -----------------------------
+def wake_listener():
+    global wake_word_detected
+
+    recognizer = sr.Recognizer()
+    mic = sr.Microphone()
+
+    with mic as source:
+        recognizer.adjust_for_ambient_noise(source, duration=1)
+
+    while True:
+        try:
+            with mic as source:
+                audio = recognizer.listen(source, phrase_time_limit=3)
+
+            text = recognizer.recognize_google(audio).lower()
+
+            if "hi matilda" in text:
+                wake_word_detected = True
+                print("Wake word detected")
+
+        except Exception:
+            pass
+
+
+threading.Thread(target=wake_listener, daemon=True).start()
+
+
+# -----------------------------
+# MAIN LOOP
+# -----------------------------
 while True:
+
     ret, frame = cap.read()
     if not ret:
         break
 
     faces = detect_faces(frame)
+    now = time.time()
 
-    # no faces -> reset everything
+    # ---------------------------------
+    # No faces detected
+    # ---------------------------------
     if len(faces) == 0:
+
         attention.reset()
-        selector.reset()
+        selected_idx = None
+        conversation_active = False
+
         _last_emotion = None
         _stable_emotion_count = 0
-        _selected_last_idx = None
+
         cv2.imshow("Matilda's Eye", frame)
+
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
+
         continue
 
-    # MULTI-CUSTOMER: choose one by hand raise
-    selected_idx = selector.pick_customer(frame, faces)
+    # ---------------------------------
+    # expire conversation if timeout
+    # ---------------------------------
+    if conversation_active and now > selected_until:
+        conversation_active = False
+        selected_idx = None
 
-    if len(faces) > 1 and selected_idx is None:
-        # show instruction overlay while waiting
-        instruction_frames = 20
+    # ---------------------------------
+    # MULTI CUSTOMER LOGIC
+    # ---------------------------------
+    if len(faces) > 1:
 
-    # If selection changed, reset emotion stability so it doesn't speak instantly
-    if selected_idx is not None and selected_idx != _selected_last_idx:
-        _last_emotion = None
-        _stable_emotion_count = 0
-        _selected_last_idx = selected_idx
+        # prompt only if idle
+        if not conversation_active:
 
-    # Draw all faces; process ONLY selected
+            if now - last_multi_prompt_time > MULTI_PROMPT_COOLDOWN_SEC:
+                say_text(
+                    "Hello everyone. If you want to talk to me, please say Hi Matilda."
+                )
+                last_multi_prompt_time = now
+                instruction_frames = 60
+
+            # wake word triggered
+            if wake_word_detected:
+
+                # choose largest face (closest speaker)
+                selected_idx = max(
+                    range(len(faces)),
+                    key=lambda i: faces[i][2] * faces[i][3]
+                )
+
+                conversation_active = True
+                selected_until = now + SELECTION_HOLD_SEC
+                wake_word_detected = False
+
+                say_text("Hello! I am listening to you.")
+                hello_text_frames = 45
+
+        else:
+            # if selected face disappears
+            if selected_idx is None or selected_idx >= len(faces):
+                conversation_active = False
+                selected_idx = None
+
+    else:
+        # only one person
+        selected_idx = 0
+        conversation_active = True
+        selected_until = now + SELECTION_HOLD_SEC
+
+    # ---------------------------------
+    # PROCESS FACES
+    # ---------------------------------
     for idx, (x, y, w, h) in enumerate(faces):
+
         face_img = frame[y:y+h, x:x+w]
 
-        # highlight selected face
         if selected_idx == idx:
-            box_color = (0, 255, 255)  # yellow
+            color = (0, 255, 255)
             thickness = 3
         else:
-            box_color = (0, 255, 0)    # green
+            color = (0, 255, 0)
             thickness = 2
 
-        cv2.rectangle(frame, (x, y), (x+w, y+h), box_color, thickness)
+        cv2.rectangle(frame, (x, y), (x+w, y+h), color, thickness)
 
-        # Only detect emotion + speak for selected customer
-        if selected_idx is None or idx != selected_idx:
+        if idx != selected_idx:
             continue
 
-        # ✅ Greeting first (new person)
-        # (This will happen only for the selected person)
-        if should_greet(face_img):
+        # greeting
+        if should_greet(face_img) and (now - last_hello_time > HELLO_COOLDOWN_SEC):
             say_hello()
             hello_text_frames = 45
+            last_hello_time = now
 
-        # ✅ Attention mode on selected customer only
-        engaged, should_speak = attention.update((x, y, w, h), frame.shape, stable=True)
+        # attention mode
+        engaged, _ = attention.update((x, y, w, h), frame.shape, stable=True)
+
         if engaged:
             attention_text_frames = 45
 
-        # ✅ Emotion on selected customer only
+        # emotion detection
         emotion, confidence = predict_emotion(face_img)
 
-        # Draw label on selected face
         cv2.putText(
             frame,
             f"{emotion} ({confidence:.2f})",
@@ -132,9 +244,7 @@ while True:
             2
         )
 
-        # ---- emotion stability + cooldown speech ----
-        now = time.time()
-
+        # emotion stability
         if emotion == _last_emotion:
             _stable_emotion_count += 1
         else:
@@ -146,36 +256,76 @@ while True:
             and confidence >= EMOTION_MIN_CONF
             and (now - _last_emotion_spoken_time) >= EMOTION_COOLDOWN_SEC
         ):
+
             sentence = get_emotion_sentence(emotion)
+
             if sentence and _last_emotion_spoken_label != emotion:
-                # IMPORTANT: Hello should be first, then emotion
-                # Your greeting happens above; here we only speak emotion afterward.
+
                 say_text(sentence)
+
                 _last_emotion_spoken_time = now
                 _last_emotion_spoken_label = emotion
-        # --------------------------------------------
 
-    # Overlays
+    # ---------------------------------
+    # UI overlays
+    # ---------------------------------
     if hello_text_frames > 0:
-        cv2.putText(frame, "Hello!", (20, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 0, 0), 3)
+
+        cv2.putText(
+            frame,
+            "Hello!",
+            (20, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.4,
+            (255, 0, 0),
+            3
+        )
+
         hello_text_frames -= 1
 
     if attention_text_frames > 0:
-        cv2.putText(frame, "ATTENTION MODE", (20, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+
+        cv2.putText(
+            frame,
+            "ATTENTION MODE",
+            (20, 110),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 200, 255),
+            2
+        )
+
         attention_text_frames -= 1
 
-    if instruction_frames > 0:
-        cv2.putText(frame, "Multiple customers detected:", (20, 150),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(frame, "Raise your hand to talk to Matilda", (20, 180),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    if instruction_frames > 0 and len(faces) > 1 and not conversation_active:
+
+        cv2.putText(
+            frame,
+            "Multiple customers detected",
+            (20, 150),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            "Say 'Hi Matilda' to talk",
+            (20, 180),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2
+        )
+
         instruction_frames -= 1
 
     cv2.imshow("Matilda's Eye", frame)
+
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
+
 
 cap.release()
 cv2.destroyAllWindows()
