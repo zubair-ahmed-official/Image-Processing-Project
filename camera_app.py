@@ -1,6 +1,8 @@
 import cv2
 import time
 import threading
+import requests
+from collections import deque, Counter
 import speech_recognition as sr
 
 from face_detection import detect_faces
@@ -8,6 +10,25 @@ from emotion_predictor import predict_emotion
 from person_tracker import should_greet
 from voice import start_voice_worker, say_hello, say_text
 from attention_mode import AttentionMode
+
+# -----------------------------
+# WEBHOOK CONFIG
+# -----------------------------
+WEBHOOK_URL = "http://127.0.0.1:5000/webhook"
+
+
+def send_webhook(detection_status: str, emotion_status: str):
+    payload = {
+        "detection_status": detection_status,
+        "emotion_status": emotion_status
+    }
+
+    try:
+        response = requests.post(WEBHOOK_URL, json=payload, timeout=5)
+        print(f"Webhook sent: {payload} | Status: {response.status_code}")
+    except requests.RequestException as e:
+        print(f"Webhook error: {e}")
+
 
 start_voice_worker()
 cap = cv2.VideoCapture(0)
@@ -40,18 +61,31 @@ wake_word_detected = False
 # -----------------------------
 # emotion speech tuning
 # -----------------------------
-EMOTION_MIN_CONF = 0.55
-EMOTION_STABLE_FRAMES = 6
-EMOTION_COOLDOWN_SEC = 10
+EMOTION_MIN_CONF = 0.60
+EMOTION_STABLE_FRAMES = 10
+EMOTION_COOLDOWN_SEC = 12
 
 _last_emotion = None
 _stable_emotion_count = 0
 _last_emotion_spoken_time = 0.0
 _last_emotion_spoken_label = None
 
+# -----------------------------
+# emotion smoothing
+# -----------------------------
+EMOTION_HISTORY_SIZE = 12
+SMOOTHED_MIN_COUNT = 6
+emotion_history = deque(maxlen=EMOTION_HISTORY_SIZE)
+
 # greeting cooldown
 last_hello_time = 0.0
 HELLO_COOLDOWN_SEC = 8
+
+# -----------------------------
+# webhook state tracking
+# -----------------------------
+person_present = False
+last_sent_emotion = None
 
 
 def get_emotion_sentence(emotion: str):
@@ -62,20 +96,58 @@ def get_emotion_sentence(emotion: str):
 
     if "happy" in e:
         return "You look happy today! Glad to see you happy!"
-
     if "sad" in e:
         return "You look a bit sad. I hope everything is okay."
-
     if "angry" in e:
         return "You seem angry. Take a deep breath. I'm here if you need a moment."
-
     if "surprise" in e:
         return "You look surprised! Something interesting happened?"
-
     if "fear" in e:
         return "You look worried. It's okay. Take your time."
 
     return None
+
+
+def reset_emotion_tracking():
+    global _last_emotion
+    global _stable_emotion_count
+    global _last_emotion_spoken_label
+    global emotion_history
+
+    _last_emotion = None
+    _stable_emotion_count = 0
+    _last_emotion_spoken_label = None
+    emotion_history.clear()
+
+
+def reset_person_state():
+    global person_present
+    global last_sent_emotion
+
+    person_present = False
+    last_sent_emotion = None
+
+
+def get_smoothed_emotion(current_emotion: str, current_confidence: float):
+    """
+    Smooth emotion predictions using a short history buffer.
+    Only add predictions to history when confidence is high enough.
+    """
+    global emotion_history
+
+    if current_emotion and current_confidence >= EMOTION_MIN_CONF:
+        emotion_history.append(current_emotion.lower())
+
+    if not emotion_history:
+        return current_emotion.lower() if current_emotion else current_emotion
+
+    counts = Counter(emotion_history)
+    most_common_emotion, count = counts.most_common(1)[0]
+
+    if count >= SMOOTHED_MIN_COUNT:
+        return most_common_emotion
+
+    return current_emotion.lower() if current_emotion else current_emotion
 
 
 # -----------------------------
@@ -123,7 +195,6 @@ threading.Thread(target=wake_listener, daemon=True).start()
 # MAIN LOOP
 # -----------------------------
 while True:
-
     ret, frame = cap.read()
     if not ret:
         break
@@ -135,13 +206,15 @@ while True:
     # No faces detected
     # ---------------------------------
     if len(faces) == 0:
+        if person_present:
+            send_webhook("person_left", "none")
+            reset_person_state()
+            print("No one detected")
 
         attention.reset()
         selected_idx = None
         conversation_active = False
-
-        _last_emotion = None
-        _stable_emotion_count = 0
+        reset_emotion_tracking()
 
         cv2.imshow("Matilda's Eye", frame)
 
@@ -154,17 +227,20 @@ while True:
     # expire conversation if timeout
     # ---------------------------------
     if conversation_active and now > selected_until:
+        if person_present:
+            send_webhook("person_left", "none")
+            reset_person_state()
+            print("No one detected")
+
         conversation_active = False
         selected_idx = None
+        reset_emotion_tracking()
 
     # ---------------------------------
     # MULTI CUSTOMER LOGIC
     # ---------------------------------
     if len(faces) > 1:
-
-        # prompt only if idle
         if not conversation_active:
-
             if now - last_multi_prompt_time > MULTI_PROMPT_COOLDOWN_SEC:
                 say_text(
                     "Hello everyone. If you want to talk to me, please say Hi Matilda."
@@ -172,10 +248,7 @@ while True:
                 last_multi_prompt_time = now
                 instruction_frames = 60
 
-            # wake word triggered
             if wake_word_detected:
-
-                # choose largest face (closest speaker)
                 selected_idx = max(
                     range(len(faces)),
                     key=lambda i: faces[i][2] * faces[i][3]
@@ -184,18 +257,27 @@ while True:
                 conversation_active = True
                 selected_until = now + SELECTION_HOLD_SEC
                 wake_word_detected = False
+                reset_emotion_tracking()
+                reset_person_state()
 
                 say_text("Hello! I am listening to you.")
                 hello_text_frames = 45
-
         else:
-            # if selected face disappears
             if selected_idx is None or selected_idx >= len(faces):
                 conversation_active = False
                 selected_idx = None
+                reset_emotion_tracking()
+
+                if person_present:
+                    send_webhook("person_left", "none")
+                    reset_person_state()
+                    print("No one detected")
 
     else:
-        # only one person
+        if selected_idx != 0 or not conversation_active:
+            reset_emotion_tracking()
+            reset_person_state()
+
         selected_idx = 0
         conversation_active = True
         selected_until = now + SELECTION_HOLD_SEC
@@ -204,8 +286,7 @@ while True:
     # PROCESS FACES
     # ---------------------------------
     for idx, (x, y, w, h) in enumerate(faces):
-
-        face_img = frame[y:y+h, x:x+w]
+        face_img = frame[y:y + h, x:x + w]
 
         if selected_idx == idx:
             color = (0, 255, 255)
@@ -214,7 +295,7 @@ while True:
             color = (0, 255, 0)
             thickness = 2
 
-        cv2.rectangle(frame, (x, y), (x+w, y+h), color, thickness)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
 
         if idx != selected_idx:
             continue
@@ -227,12 +308,14 @@ while True:
 
         # attention mode
         engaged, _ = attention.update((x, y, w, h), frame.shape, stable=True)
-
         if engaged:
             attention_text_frames = 45
 
-        # emotion detection
-        emotion, confidence = predict_emotion(face_img)
+        # raw emotion detection
+        raw_emotion, confidence = predict_emotion(face_img)
+
+        # smoothed emotion detection
+        emotion = get_smoothed_emotion(raw_emotion, confidence)
 
         cv2.putText(
             frame,
@@ -251,18 +334,34 @@ while True:
             _last_emotion = emotion
             _stable_emotion_count = 1
 
+        # -----------------------------
+        # WEBHOOK STATUS LOGIC
+        # -----------------------------
+        if (
+            emotion
+            and confidence >= EMOTION_MIN_CONF
+            and _stable_emotion_count >= EMOTION_STABLE_FRAMES
+        ):
+            if not person_present:
+                send_webhook("person_detected", emotion)
+                person_present = True
+                last_sent_emotion = emotion
+            elif emotion != last_sent_emotion:
+                send_webhook("person_alive", emotion)
+                last_sent_emotion = emotion
+
+        # -----------------------------
+        # VOICE EMOTION RESPONSE
+        # -----------------------------
         if (
             _stable_emotion_count >= EMOTION_STABLE_FRAMES
             and confidence >= EMOTION_MIN_CONF
             and (now - _last_emotion_spoken_time) >= EMOTION_COOLDOWN_SEC
         ):
-
             sentence = get_emotion_sentence(emotion)
 
             if sentence and _last_emotion_spoken_label != emotion:
-
                 say_text(sentence)
-
                 _last_emotion_spoken_time = now
                 _last_emotion_spoken_label = emotion
 
@@ -270,7 +369,6 @@ while True:
     # UI overlays
     # ---------------------------------
     if hello_text_frames > 0:
-
         cv2.putText(
             frame,
             "Hello!",
@@ -280,11 +378,9 @@ while True:
             (255, 0, 0),
             3
         )
-
         hello_text_frames -= 1
 
     if attention_text_frames > 0:
-
         cv2.putText(
             frame,
             "ATTENTION MODE",
@@ -294,11 +390,9 @@ while True:
             (0, 200, 255),
             2
         )
-
         attention_text_frames -= 1
 
     if instruction_frames > 0 and len(faces) > 1 and not conversation_active:
-
         cv2.putText(
             frame,
             "Multiple customers detected",
@@ -308,7 +402,6 @@ while True:
             (0, 255, 255),
             2
         )
-
         cv2.putText(
             frame,
             "Say 'Hi Matilda' to talk",
@@ -318,14 +411,12 @@ while True:
             (0, 255, 255),
             2
         )
-
         instruction_frames -= 1
 
     cv2.imshow("Matilda's Eye", frame)
 
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
-
 
 cap.release()
 cv2.destroyAllWindows()
