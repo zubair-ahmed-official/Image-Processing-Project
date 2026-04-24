@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Matilda Camera Tracker</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #111;
+      color: white;
+      text-align: center;
+    }
+
+    img {
+      width: 720px;
+      max-width: 95%;
+      border: 3px solid #444;
+      border-radius: 10px;
+    }
+
+    .status {
+      margin-top: 15px;
+      font-size: 18px;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Matilda Camera Tracker</h1>
+
+  <img id="camera" />
+
+  <div class="status">
+    <p>Connection: <span id="connection">Disconnected</span></p>
+    <p>Faces: <span id="faces">0</span></p>
+    <p>Emotion: <span id="emotion">none</span></p>
+    <p>Conversation Active: <span id="conversation">false</span></p>
+    <p>Person Present: <span id="person">false</span></p>
+  </div>
+
+  <script>
+    const socket = new WebSocket("ws://127.0.0.1:8080");
+
+    const camera = document.getElementById("camera");
+    const connection = document.getElementById("connection");
+    const faces = document.getElementById("faces");
+    const emotion = document.getElementById("emotion");
+    const conversation = document.getElementById("conversation");
+    const person = document.getElementById("person");
+
+    socket.onopen = () => {
+      connection.textContent = "Connected";
+    };
+
+    socket.onclose = () => {
+      connection.textContent = "Disconnected";
+    };
+
+    socket.onmessage = (event) => {
+        console.log("Received:", event.data.substring(0, 100));
+        const data = JSON.parse(event.data);
+
+      if (data.type === "camera_frame") {
+        camera.src = "data:image/jpeg;base64," + data.image;
+
+        faces.textContent = data.faces_count;
+        emotion.textContent = data.emotion;
+        conversation.textContent = data.conversation_active;
+        person.textContent = data.person_present;
+      }
+    };
+  </script>
+
+</body>
+</html>
