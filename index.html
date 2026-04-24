@@ -1,74 +1,56 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Matilda Camera Tracker</title>
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      background: #111;
-      color: white;
-      text-align: center;
-    }
+<video id="video" autoplay playsinline muted></video>
+<canvas id="canvas" width="640" height="480" style="display:none;"></canvas>
+<img id="processed" width="640" />
 
-    img {
-      width: 720px;
-      max-width: 95%;
-      border: 3px solid #444;
-      border-radius: 10px;
-    }
+<p>Status: <span id="status">Disconnected</span></p>
+<p>Faces: <span id="faces">0</span></p>
+<p>Emotion: <span id="emotion">none</span></p>
 
-    .status {
-      margin-top: 15px;
-      font-size: 18px;
-    }
-  </style>
-</head>
-<body>
+<script>
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const processed = document.getElementById("processed");
+const statusEl = document.getElementById("status");
+const facesEl = document.getElementById("faces");
+const emotionEl = document.getElementById("emotion");
 
-  <h1>Matilda Camera Tracker</h1>
+const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+const socket = new WebSocket(`${protocol}//${location.host}/ws`);
 
-  <img id="camera" />
+socket.onopen = async () => {
+  statusEl.textContent = "Connected";
 
-  <div class="status">
-    <p>Connection: <span id="connection">Disconnected</span></p>
-    <p>Faces: <span id="faces">0</span></p>
-    <p>Emotion: <span id="emotion">none</span></p>
-    <p>Conversation Active: <span id="conversation">false</span></p>
-    <p>Person Present: <span id="person">false</span></p>
-  </div>
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 640, height: 480 },
+    audio: false
+  });
 
-  <script>
-    const socket = new WebSocket("ws://127.0.0.1:8080");
+  video.srcObject = stream;
 
-    const camera = document.getElementById("camera");
-    const connection = document.getElementById("connection");
-    const faces = document.getElementById("faces");
-    const emotion = document.getElementById("emotion");
-    const conversation = document.getElementById("conversation");
-    const person = document.getElementById("person");
+  setInterval(sendFrame, 150); // about 6–7 FPS
+};
 
-    socket.onopen = () => {
-      connection.textContent = "Connected";
-    };
+socket.onmessage = (event) => {
+  const data = JSON.parse(event.data);
 
-    socket.onclose = () => {
-      connection.textContent = "Disconnected";
-    };
+  if (data.type === "processed_frame") {
+    processed.src = "data:image/jpeg;base64," + data.image;
+    facesEl.textContent = data.faces_count;
+    emotionEl.textContent = data.emotion;
+  }
+};
 
-    socket.onmessage = (event) => {
-        console.log("Received:", event.data.substring(0, 100));
-        const data = JSON.parse(event.data);
+function sendFrame() {
+  if (socket.readyState !== WebSocket.OPEN) return;
 
-      if (data.type === "camera_frame") {
-        camera.src = "data:image/jpeg;base64," + data.image;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-        faces.textContent = data.faces_count;
-        emotion.textContent = data.emotion;
-        conversation.textContent = data.conversation_active;
-        person.textContent = data.person_present;
-      }
-    };
-  </script>
+  const image = canvas.toDataURL("image/jpeg", 0.65);
 
-</body>
-</html>
+  socket.send(JSON.stringify({
+    type: "camera_frame",
+    image: image
+  }));
+}
+</script>

@@ -5,6 +5,7 @@ import asyncio
 import json
 import base64
 import requests
+import numpy as np
 from collections import deque, Counter
 import speech_recognition as sr
 import websockets
@@ -14,6 +15,8 @@ from emotion_predictor import predict_emotion
 from person_tracker import should_greet
 from voice import start_voice_worker, say_hello, say_text
 from attention_mode import AttentionMode
+from aiohttp import web
+
 
 
 # -----------------------------
@@ -26,16 +29,79 @@ TARGET_FPS = 10
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 last_frame_sent_time = 0.0
 
+def decode_browser_image(data_url):
+    header, encoded = data_url.split(",", 1)
+    image_bytes = base64.b64decode(encoded)
 
-async def ws_handler(websocket):
-    connected_clients.add(websocket)
-    print("Browser connected")
+    np_arr = np.frombuffer(image_bytes, np.uint8)
+    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-    try:
-        await websocket.wait_closed()
-    finally:
-        connected_clients.discard(websocket)
-        print("Browser disconnected")
+    return frame
+
+
+def encode_frame(frame):
+    success, buffer = cv2.imencode(
+        ".jpg",
+        frame,
+        [cv2.IMWRITE_JPEG_QUALITY, 65]
+    )
+
+    if not success:
+        return None
+
+    return base64.b64encode(buffer).decode("utf-8")
+
+
+async def index_handler(request):
+    return web.FileResponse("index.html")
+
+async def ws_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    print("Device connected")
+
+    async for msg in ws:
+        if msg.type == web.WSMsgType.TEXT:
+            data = json.loads(msg.data)
+
+            if data.get("type") == "camera_frame":
+                frame = decode_browser_image(data["image"])
+
+                faces = detect_faces(frame)
+
+                current_emotion = "none"
+
+                for (x, y, w, h) in faces:
+                    face_img = frame[y:y + h, x:x + w]
+
+                    emotion, confidence = predict_emotion(face_img)
+                    current_emotion = emotion if emotion else "none"
+
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+
+                    cv2.putText(
+                        frame,
+                        f"{current_emotion} ({confidence:.2f})",
+                        (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 255),
+                        2
+                    )
+
+                encoded_frame = encode_frame(frame)
+
+                if encoded_frame:
+                    await ws.send_str(json.dumps({
+                        "type": "processed_frame",
+                        "image": encoded_frame,
+                        "faces_count": len(faces),
+                        "emotion": current_emotion
+                    }))
+
+    print("Device disconnected")
+    return ws
 
 
 async def broadcast(payload):
@@ -44,10 +110,9 @@ async def broadcast(payload):
 
     message = json.dumps(payload)
 
-    await asyncio.gather(
-        *[client.send(message) for client in list(connected_clients)],
-        return_exceptions=True
-    )
+    for ws in list(connected_clients):
+        if not ws.closed:
+            await ws.send_str(message)
 
 
 def send_to_browser(payload):
@@ -55,15 +120,15 @@ def send_to_browser(payload):
         asyncio.run_coroutine_threadsafe(broadcast(payload), ws_loop)
 
 
-def encode_frame(frame):
-    # Reduce size for browser stability
-    frame = cv2.resize(frame, (640, 480))
-    success, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+# def encode_frame(frame):
+#     # Reduce size for browser stability
+#     frame = cv2.resize(frame, (640, 480))
+#     success, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
 
-    if not success:
-        return None
+#     if not success:
+#         return None
 
-    return base64.b64encode(buffer).decode("utf-8")
+#     return base64.b64encode(buffer).decode("utf-8")
 
 
 async def ws_main():
@@ -72,12 +137,26 @@ async def ws_main():
         await asyncio.Future()
 
 
-def start_ws_server():
-    global ws_loop
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", index_handler)
+    app.router.add_get("/index.html", index_handler)
+    app.router.add_get("/ws", ws_handler)
 
-    ws_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(ws_loop)
-    ws_loop.run_until_complete(ws_main())
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
+
+    print("HTTP + WebSocket server running on http://127.0.0.1:8080")
+    await asyncio.Future()
+
+asyncio.run(start_web_server())
+
+async def ws_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
 
 
 def send_status_ws(detection_status, emotion_status, faces_count=0):
