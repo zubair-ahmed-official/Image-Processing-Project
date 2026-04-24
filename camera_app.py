@@ -87,6 +87,15 @@ HELLO_COOLDOWN_SEC = 8
 person_present = False
 last_sent_emotion = None
 
+# -----------------------------
+# detection delay config
+# -----------------------------
+DETECTION_DELAY_SEC = 2.0
+DETECTION_LOST_DELAY_SEC = 2.0
+
+detection_start_time = None
+no_face_start_time = None
+
 
 def get_emotion_sentence(emotion: str):
     if not emotion:
@@ -123,9 +132,11 @@ def reset_emotion_tracking():
 def reset_person_state():
     global person_present
     global last_sent_emotion
+    global detection_start_time
 
     person_present = False
     last_sent_emotion = None
+    detection_start_time = None
 
 
 def get_smoothed_emotion(current_emotion: str, current_confidence: float):
@@ -202,11 +213,19 @@ while True:
     faces = detect_faces(frame)
     now = time.time()
 
+    if len(faces) > 0:
+        no_face_start_time = None
+
     # ---------------------------------
     # No faces detected
     # ---------------------------------
     if len(faces) == 0:
-        if person_present:
+        detection_start_time = None
+
+        if no_face_start_time is None:
+            no_face_start_time = now
+
+        if person_present and (now - no_face_start_time >= DETECTION_LOST_DELAY_SEC):
             send_webhook("person_left", "none")
             reset_person_state()
             print("No one detected")
@@ -240,6 +259,8 @@ while True:
     # MULTI CUSTOMER LOGIC
     # ---------------------------------
     if len(faces) > 1:
+        detection_start_time = None
+
         if not conversation_active:
             if now - last_multi_prompt_time > MULTI_PROMPT_COOLDOWN_SEC:
                 say_text(
@@ -343,12 +364,19 @@ while True:
             and _stable_emotion_count >= EMOTION_STABLE_FRAMES
         ):
             if not person_present:
-                send_webhook("person_detected", emotion)
-                person_present = True
-                last_sent_emotion = emotion
-            elif emotion != last_sent_emotion:
-                send_webhook("person_alive", emotion)
-                last_sent_emotion = emotion
+                if detection_start_time is None:
+                    detection_start_time = now
+
+                if now - detection_start_time >= DETECTION_DELAY_SEC:
+                    send_webhook("person_detected", emotion)
+                    person_present = True
+                    last_sent_emotion = emotion
+            else:
+                detection_start_time = None
+
+                if emotion != last_sent_emotion:
+                    send_webhook("person_alive", emotion)
+                    last_sent_emotion = emotion
 
         # -----------------------------
         # VOICE EMOTION RESPONSE
