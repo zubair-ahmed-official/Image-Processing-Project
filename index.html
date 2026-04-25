@@ -38,6 +38,13 @@ socket.onmessage = (event) => {
     facesEl.textContent = data.faces_count;
     emotionEl.textContent = data.emotion;
   }
+  if (data.event_name === "person_detected") {
+      console.log("Person detected");
+    }
+
+  if (data.event_name === "person_left") {
+    console.log("Person left");
+  }
 };
 
 function sendFrame() {
@@ -53,4 +60,5 @@ function sendFrame() {
     image: image
   }));
 }
+setInterval(sendFrame, 250);
 </script>

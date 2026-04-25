@@ -1,52 +1,37 @@
-import cv2
-import time
-import threading
 import asyncio
-import json
 import base64
-import requests
+import json
+import time
+
+import cv2
 import numpy as np
-from collections import deque, Counter
-import speech_recognition as sr
-import websockets
+from aiohttp import web
 
 from face_detection import detect_faces
 from emotion_predictor import predict_emotion
-from person_tracker import should_greet
-from voice import start_voice_worker, say_hello, say_text
-from attention_mode import AttentionMode
-from aiohttp import web
+from voice import start_voice_worker, say_text
 
 
+device_states = {}
 
-# -----------------------------
-# WebSocket config
-# -----------------------------
-connected_clients = set()
-ws_loop = None
-
-TARGET_FPS = 10
-FRAME_INTERVAL = 1.0 / TARGET_FPS
-last_frame_sent_time = 0.0
 
 def decode_browser_image(data_url):
-    header, encoded = data_url.split(",", 1)
-    image_bytes = base64.b64decode(encoded)
+    if "," in data_url:
+        data_url = data_url.split(",", 1)[1]
 
+    image_bytes = base64.b64decode(data_url)
     np_arr = np.frombuffer(image_bytes, np.uint8)
-    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-    return frame
+    return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
 
 def encode_frame(frame):
-    success, buffer = cv2.imencode(
+    ok, buffer = cv2.imencode(
         ".jpg",
         frame,
         [cv2.IMWRITE_JPEG_QUALITY, 65]
     )
 
-    if not success:
+    if not ok:
         return None
 
     return base64.b64encode(buffer).decode("utf-8")
@@ -55,89 +40,130 @@ def encode_frame(frame):
 async def index_handler(request):
     return web.FileResponse("index.html")
 
+
+async def safe_send(ws, payload):
+    if ws.closed:
+        return False
+
+    try:
+        await ws.send_str(json.dumps(payload))
+        return True
+    except ConnectionResetError:
+        return False
+    except Exception as e:
+        print("WebSocket send error:", e)
+        return False
+
 async def ws_handler(request):
-    ws = web.WebSocketResponse()
+    ws = web.WebSocketResponse(max_msg_size=10 * 1024 * 1024)
     await ws.prepare(request)
 
-    print("Device connected")
+    device_id = id(ws)
 
-    async for msg in ws:
-        if msg.type == web.WSMsgType.TEXT:
+    device_states[device_id] = {
+        "person_present": False,
+        "no_face_start_time": None
+    }
+
+    print(f"Device connected: {device_id}")
+
+    try:
+        async for msg in ws:
+            if msg.type != web.WSMsgType.TEXT:
+                continue
+
             data = json.loads(msg.data)
 
-            if data.get("type") == "camera_frame":
-                frame = decode_browser_image(data["image"])
+            if data.get("type") != "camera_frame":
+                continue
 
-                faces = detect_faces(frame)
+            frame = decode_browser_image(data["image"])
 
-                current_emotion = "none"
+            if frame is None:
+                continue
 
-                for (x, y, w, h) in faces:
-                    face_img = frame[y:y + h, x:x + w]
+            faces = detect_faces(frame)
+            state = device_states[device_id]
 
-                    emotion, confidence = predict_emotion(face_img)
-                    current_emotion = emotion if emotion else "none"
+            # -----------------------------
+            # Send person event only on state change
+            # -----------------------------
+            now = time.time()
 
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+            if len(faces) > 0:
+                state["no_face_start_time"] = None
 
-                    cv2.putText(
-                        frame,
-                        f"{current_emotion} ({confidence:.2f})",
-                        (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 255, 255),
-                        2
-                    )
+                if not state["person_present"]:
+                    state["person_present"] = True
 
-                encoded_frame = encode_frame(frame)
-
-                if encoded_frame:
-                    await ws.send_str(json.dumps({
-                        "type": "processed_frame",
-                        "image": encoded_frame,
+                    ok = await safe_send(ws, {
+                        "type": "event",
+                        "event_name": "person_detected",
                         "faces_count": len(faces),
-                        "emotion": current_emotion
-                    }))
+                        "timestamp": now
+                    })
 
-    print("Device disconnected")
+                    if not ok:
+                        break
+
+            else:
+                if state["person_present"]:
+                    if state["no_face_start_time"] is None:
+                        state["no_face_start_time"] = now
+
+                    elif now - state["no_face_start_time"] >= 1.5:
+                        state["person_present"] = False
+                        state["no_face_start_time"] = None
+
+                        ok = await safe_send(ws, {
+                            "type": "event",
+                            "event_name": "person_left",
+                            "faces_count": 0,
+                            "timestamp": now
+                        })
+
+                        if not ok:
+                            break
+
+            current_emotion = "none"
+
+            for (x, y, w, h) in faces:
+                face_img = frame[y:y + h, x:x + w]
+
+                emotion, confidence = predict_emotion(face_img)
+                current_emotion = emotion if emotion else "none"
+
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+
+                cv2.putText(
+                    frame,
+                    f"{current_emotion}",
+                    (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2
+                )
+
+            encoded = encode_frame(frame)
+
+            if encoded:
+                await ws.send_str(json.dumps({
+                    "type": "processed_frame",
+                    "image": encoded,
+                    "faces_count": len(faces),
+                    "emotion": current_emotion,
+                    "person_present": state["person_present"]
+                }))
+
+    finally:
+        device_states.pop(device_id, None)
+        print(f"Device disconnected: {device_id}")
+
     return ws
 
 
-async def broadcast(payload):
-    if not connected_clients:
-        return
-
-    message = json.dumps(payload)
-
-    for ws in list(connected_clients):
-        if not ws.closed:
-            await ws.send_str(message)
-
-
-def send_to_browser(payload):
-    if ws_loop and connected_clients:
-        asyncio.run_coroutine_threadsafe(broadcast(payload), ws_loop)
-
-
-# def encode_frame(frame):
-#     # Reduce size for browser stability
-#     frame = cv2.resize(frame, (640, 480))
-#     success, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
-
-#     if not success:
-#         return None
-
-#     return base64.b64encode(buffer).decode("utf-8")
-
-
-async def ws_main():
-    async with websockets.serve(ws_handler, "0.0.0.0", 8080):
-        print("WebSocket server running on ws://0.0.0.0:8080")
-        await asyncio.Future()
-
-
-async def start_web_server():
+async def main():
     app = web.Application()
     app.router.add_get("/", index_handler)
     app.router.add_get("/index.html", index_handler)
@@ -149,422 +175,8 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
 
-    print("HTTP + WebSocket server running on http://127.0.0.1:8080")
+    print("Server running on http://127.0.0.1:8080")
     await asyncio.Future()
 
-asyncio.run(start_web_server())
 
-async def ws_handler(request):
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-
-
-def send_status_ws(detection_status, emotion_status, faces_count=0):
-    send_to_browser({
-        "type": "camera_status",
-        "detection_status": detection_status,
-        "emotion_status": emotion_status,
-        "faces_count": faces_count,
-        "timestamp": time.time()
-    })
-
-
-def send_frame_to_browser(frame, faces_count, selected_idx, conversation_active, emotion, person_present):
-    global last_frame_sent_time
-
-    now = time.time()
-
-    if now - last_frame_sent_time < FRAME_INTERVAL:
-        return
-
-    image = encode_frame(frame)
-
-    if image is None:
-        return
-
-    send_to_browser({
-        "type": "camera_frame",
-        "image": image,
-        "faces_count": faces_count,
-        "selected_idx": selected_idx,
-        "conversation_active": conversation_active,
-        "emotion": emotion if emotion else "none",
-        "person_present": person_present,
-        "timestamp": now
-    })
-
-    last_frame_sent_time = now
-
-
-# Start WebSocket once
-threading.Thread(target=start_ws_server, daemon=True).start()
-time.sleep(1)
-
-
-# -----------------------------
-# Voice and camera
-# -----------------------------
-start_voice_worker()
-cap = cv2.VideoCapture(0)
-
-
-# -----------------------------
-# State variables
-# -----------------------------
-hello_text_frames = 0
-attention_text_frames = 0
-instruction_frames = 0
-
-selected_idx = None
-selected_until = 0.0
-SELECTION_HOLD_SEC = 15
-
-conversation_active = False
-
-last_multi_prompt_time = 0.0
-MULTI_PROMPT_COOLDOWN_SEC = 8
-
-wake_word_detected = False
-
-EMOTION_MIN_CONF = 0.60
-EMOTION_STABLE_FRAMES = 10
-EMOTION_COOLDOWN_SEC = 12
-
-_last_emotion = None
-_stable_emotion_count = 0
-_last_emotion_spoken_time = 0.0
-_last_emotion_spoken_label = None
-
-EMOTION_HISTORY_SIZE = 12
-SMOOTHED_MIN_COUNT = 6
-emotion_history = deque(maxlen=EMOTION_HISTORY_SIZE)
-
-last_hello_time = 0.0
-HELLO_COOLDOWN_SEC = 8
-
-person_present = False
-last_sent_emotion = None
-
-
-def get_emotion_sentence(emotion: str):
-    if not emotion:
-        return None
-
-    e = emotion.lower()
-
-    if "happy" in e:
-        return "You look happy today! Glad to see you happy!"
-    if "sad" in e:
-        return "You look a bit sad. I hope everything is okay."
-    if "angry" in e:
-        return "You seem angry. Take a deep breath. I'm here if you need a moment."
-    if "surprise" in e:
-        return "You look surprised! Something interesting happened?"
-    if "fear" in e:
-        return "You look worried. It's okay. Take your time."
-
-    return None
-
-
-def reset_emotion_tracking():
-    global _last_emotion
-    global _stable_emotion_count
-    global _last_emotion_spoken_label
-    global emotion_history
-
-    _last_emotion = None
-    _stable_emotion_count = 0
-    _last_emotion_spoken_label = None
-    emotion_history.clear()
-
-
-def reset_person_state():
-    global person_present
-    global last_sent_emotion
-
-    person_present = False
-    last_sent_emotion = None
-
-
-def get_smoothed_emotion(current_emotion: str, current_confidence: float):
-    global emotion_history
-
-    if current_emotion and current_confidence >= EMOTION_MIN_CONF:
-        emotion_history.append(current_emotion.lower())
-
-    if not emotion_history:
-        return current_emotion.lower() if current_emotion else current_emotion
-
-    counts = Counter(emotion_history)
-    most_common_emotion, count = counts.most_common(1)[0]
-
-    if count >= SMOOTHED_MIN_COUNT:
-        return most_common_emotion
-
-    return current_emotion.lower() if current_emotion else current_emotion
-
-
-attention = AttentionMode(
-    seconds_required=1.6,
-    center_radius_ratio=0.22,
-    min_face_area_ratio=0.03,
-    speak_cooldown_sec=12
-)
-
-
-def wake_listener():
-    global wake_word_detected
-
-    recognizer = sr.Recognizer()
-    mic = sr.Microphone()
-
-    with mic as source:
-        recognizer.adjust_for_ambient_noise(source, duration=1)
-
-    while True:
-        try:
-            with mic as source:
-                audio = recognizer.listen(source, phrase_time_limit=3)
-
-            text = recognizer.recognize_google(audio).lower()
-
-            if "hi matilda" in text:
-                wake_word_detected = True
-                print("Wake word detected")
-
-        except Exception:
-            pass
-
-
-# Enable later if needed
-# threading.Thread(target=wake_listener, daemon=True).start()
-
-
-# -----------------------------
-# Main camera loop
-# -----------------------------
-try:
-    while True:
-        ret, frame = cap.read()
-
-        if not ret:
-            break
-
-        faces = detect_faces(frame)
-        now = time.time()
-
-        # -----------------------------
-        # No face
-        # -----------------------------
-        if len(faces) == 0:
-            if person_present:
-                send_status_ws("person_left", "none", 0)
-                reset_person_state()
-                print("No one detected")
-
-            attention.reset()
-            selected_idx = None
-            conversation_active = False
-            reset_emotion_tracking()
-
-        else:
-            # -----------------------------
-            # Conversation timeout
-            # -----------------------------
-            if conversation_active and now > selected_until:
-                if person_present:
-                    send_status_ws("person_left", "none", 0)
-                    reset_person_state()
-                    print("No one detected")
-
-                conversation_active = False
-                selected_idx = None
-                reset_emotion_tracking()
-
-            # -----------------------------
-            # Multi-customer logic
-            # -----------------------------
-            if len(faces) > 1:
-                if not conversation_active:
-                    if now - last_multi_prompt_time > MULTI_PROMPT_COOLDOWN_SEC:
-                        say_text("Hello everyone. If you want to talk to me, please say Hi Matilda.")
-                        last_multi_prompt_time = now
-                        instruction_frames = 60
-
-                    if wake_word_detected:
-                        selected_idx = max(
-                            range(len(faces)),
-                            key=lambda i: faces[i][2] * faces[i][3]
-                        )
-
-                        conversation_active = True
-                        selected_until = now + SELECTION_HOLD_SEC
-                        wake_word_detected = False
-                        reset_emotion_tracking()
-                        reset_person_state()
-
-                        say_text("Hello! I am listening to you.")
-                        hello_text_frames = 45
-
-                else:
-                    if selected_idx is None or selected_idx >= len(faces):
-                        conversation_active = False
-                        selected_idx = None
-                        reset_emotion_tracking()
-
-                        if person_present:
-                            send_status_ws("person_left", "none", 0)
-                            reset_person_state()
-                            print("No one detected")
-
-            # -----------------------------
-            # Single customer
-            # -----------------------------
-            else:
-                if selected_idx != 0 or not conversation_active:
-                    reset_emotion_tracking()
-                    reset_person_state()
-
-                selected_idx = 0
-                conversation_active = True
-                selected_until = now + SELECTION_HOLD_SEC
-
-            # -----------------------------
-            # Process faces
-            # -----------------------------
-            for idx, (x, y, w, h) in enumerate(faces):
-                face_img = frame[y:y + h, x:x + w]
-
-                if selected_idx == idx:
-                    color = (0, 255, 255)
-                    thickness = 3
-                else:
-                    color = (0, 255, 0)
-                    thickness = 2
-
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
-
-                if idx != selected_idx:
-                    continue
-
-                if should_greet(face_img) and (now - last_hello_time > HELLO_COOLDOWN_SEC):
-                    say_hello()
-                    hello_text_frames = 45
-                    last_hello_time = now
-
-                engaged, _ = attention.update((x, y, w, h), frame.shape, stable=True)
-
-                if engaged:
-                    attention_text_frames = 45
-
-                raw_emotion, confidence = predict_emotion(face_img)
-                emotion = get_smoothed_emotion(raw_emotion, confidence)
-
-                cv2.putText(
-                    frame,
-                    f"{emotion} ({confidence:.2f})",
-                    (x, y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 255),
-                    2
-                )
-
-                if emotion == _last_emotion:
-                    _stable_emotion_count += 1
-                else:
-                    _last_emotion = emotion
-                    _stable_emotion_count = 1
-
-                if (
-                    emotion
-                    and confidence >= EMOTION_MIN_CONF
-                    and _stable_emotion_count >= EMOTION_STABLE_FRAMES
-                ):
-                    if not person_present:
-                        send_status_ws("person_detected", emotion, len(faces))
-                        person_present = True
-                        last_sent_emotion = emotion
-
-                    elif emotion != last_sent_emotion:
-                        send_status_ws("person_alive", emotion, len(faces))
-                        last_sent_emotion = emotion
-
-                if (
-                    _stable_emotion_count >= EMOTION_STABLE_FRAMES
-                    and confidence >= EMOTION_MIN_CONF
-                    and (now - _last_emotion_spoken_time) >= EMOTION_COOLDOWN_SEC
-                ):
-                    sentence = get_emotion_sentence(emotion)
-
-                    if sentence and _last_emotion_spoken_label != emotion:
-                        say_text(sentence)
-                        _last_emotion_spoken_time = now
-                        _last_emotion_spoken_label = emotion
-
-        # -----------------------------
-        # UI overlays
-        # -----------------------------
-        if hello_text_frames > 0:
-            cv2.putText(
-                frame,
-                "Hello!",
-                (20, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.4,
-                (255, 0, 0),
-                3
-            )
-            hello_text_frames -= 1
-
-        if attention_text_frames > 0:
-            cv2.putText(
-                frame,
-                "ATTENTION MODE",
-                (20, 110),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 200, 255),
-                2
-            )
-            attention_text_frames -= 1
-
-        if instruction_frames > 0 and len(faces) > 1 and not conversation_active:
-            cv2.putText(
-                frame,
-                "Multiple customers detected",
-                (20, 150),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2
-            )
-            cv2.putText(
-                frame,
-                "Say 'Hi Matilda' to talk",
-                (20, 180),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 255),
-                2
-            )
-            instruction_frames -= 1
-
-        # -----------------------------
-        # Send frame ONCE per loop, throttled
-        # -----------------------------
-        send_frame_to_browser(
-            frame=frame,
-            faces_count=len(faces),
-            selected_idx=selected_idx,
-            conversation_active=conversation_active,
-            emotion=_last_emotion,
-            person_present=person_present
-        )
-
-except KeyboardInterrupt:
-    print("Camera stopped by user.")
-
-finally:
-    cap.release()
-    cv2.destroyAllWindows()
+asyncio.run(main())
