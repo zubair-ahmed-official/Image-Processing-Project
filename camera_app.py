@@ -95,7 +95,7 @@ async def ws_handler(request):
 
                 if not state["person_present"]:
                     state["person_present"] = True
-
+                    say_text("Hi, this is Matilda")
                     ok = await safe_send(ws, {
                         "type": "event",
                         "event_name": "person_detected",
@@ -178,5 +178,6 @@ async def main():
     print("Server running on http://127.0.0.1:8080")
     await asyncio.Future()
 
-
-asyncio.run(main())
+if __name__ == "__main__":
+    start_voice_worker()
+    asyncio.run(main())
