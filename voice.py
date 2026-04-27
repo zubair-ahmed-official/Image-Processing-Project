@@ -1,17 +1,18 @@
 import threading
 import queue
 import time
+import pythoncom
 
 _q = queue.Queue()
 _worker_started = False
 _voice = None
+
 
 def _init_voice():
     global _voice
     if _voice is not None:
         return
 
-    # Uses Windows built-in SAPI (pywin32 is usually already present)
     import win32com.client
     _voice = win32com.client.Dispatch("SAPI.SpVoice")
 
@@ -27,31 +28,43 @@ def _init_voice():
     except Exception:
         pass
 
+
 def _worker():
-    _init_voice()
-    while True:
-        text = _q.get()
-        if text is None:
-            break
-        try:
-            _voice.Speak(str(text))  # blocking speak (safe in worker)
-        except Exception as e:
-            print("SAPI TTS error:", e)
-        time.sleep(0.05)
+    pythoncom.CoInitialize()
+
+    try:
+        _init_voice()
+
+        while True:
+            text = _q.get()
+            if text is None:
+                break
+
+            try:
+                _voice.Speak(str(text))
+            except Exception as e:
+                print("SAPI TTS error:", e)
+
+            time.sleep(0.05)
+
+    finally:
+        pythoncom.CoUninitialize()
+
 
 def start_voice_worker():
     global _worker_started
     if _worker_started:
         return
+
     _worker_started = True
     threading.Thread(target=_worker, daemon=True).start()
 
-# ✅ NEW: speak any text (emotion responses etc.)
+
 def say_text(text: str):
     start_voice_worker()
     if text and isinstance(text, str):
         _q.put(text)
 
-# ✅ Keep hello (uses say_text internally)
+
 def say_hello():
     say_text("Hello")

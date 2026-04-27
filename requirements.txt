@@ -5,3 +5,4 @@ fastapi
 uvicorn
 numpy
 pillow
+pywin32
