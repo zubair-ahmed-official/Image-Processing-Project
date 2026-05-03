@@ -13,17 +13,23 @@ from emotion_predictor import predict_emotion
 from voice import start_voice_worker, say_text
 
 
-device_states = {}
+device_states = { }
+
+GREETING_COOLDOWN_SEC = 60
 
 LOOKING_REQUIRED_SEC = 3.0
 PERSON_LEFT_DELAY_SEC = 1.5
-EMOTION_RESPONSE_COOLDOWN_SEC = 6.0
+EMOTION_RESPONSE_COOLDOWN_SEC = 16.0
 
 # -----------------------------
 # Stable emotion config
 # -----------------------------
 EMOTION_HISTORY_SIZE = 12
 EMOTION_STABLE_COUNT = 7
+
+EMOTION_MIN_CONFIDENCE = 0.65
+EMOTION_HOLD_TIME_SEC = 10
+EMOTION_CHANGE_COOLDOWN = 15.0
 
 
 def get_stable_emotion(state, new_emotion):
@@ -58,7 +64,7 @@ def get_emotion_response(emotion):
     if emotion == "fear":
         return "You look worried. It is okay, take your time."
     if emotion == "neutral":
-        return "Hello, how can I help you today?"
+        return ""
     if emotion == "disgust":
         return "Something seems uncomfortable. Let me know how I can help."
 
@@ -69,16 +75,25 @@ def speak_based_on_emotion(state, emotion, now):
     if not emotion or emotion == "none":
         return
 
-    if (
-        emotion != state["last_spoken_emotion"]
-        and now - state["last_emotion_speak_time"] >= EMOTION_RESPONSE_COOLDOWN_SEC
-    ):
-        response_text = get_emotion_response(emotion)
+    last_emotion = state.get("last_spoken_emotion")
+    last_time = state.get("last_emotion_speak_time", 0)
 
-        if response_text:
-            say_text(response_text)
-            state["last_spoken_emotion"] = emotion
-            state["last_emotion_speak_time"] = now
+    # If SAME emotion → allow only after 30 seconds
+    if emotion == last_emotion:
+        if now - last_time < 30:
+            return
+
+    # If DIFFERENT emotion → still apply small cooldown
+    else:
+        if now - last_time < EMOTION_RESPONSE_COOLDOWN_SEC:
+            return
+
+    response_text = get_emotion_response(emotion)
+
+    if response_text:
+        say_text(response_text)
+        state["last_spoken_emotion"] = emotion
+        state["last_emotion_speak_time"] = now
 
 
 def decode_browser_image(data_url):
@@ -127,15 +142,33 @@ def get_closest_face_index(faces):
     return max(range(len(faces)), key=lambda i: faces[i][2] * faces[i][3])
 
 
-def get_face_emotion(frame, face, state):
+def get_face_emotion(frame, face, state, now):
     x, y, w, h = face
     face_img = frame[y:y + h, x:x + w]
 
     emotion, confidence = predict_emotion(face_img)
-    raw_emotion = emotion if emotion else "none"
-    stable_emotion = get_stable_emotion(state, raw_emotion)
 
-    return stable_emotion, confidence
+    # Ignore weak predictions
+    if not emotion or confidence < EMOTION_MIN_CONFIDENCE:
+        return state.get("stable_emotion", "none"), confidence
+
+    raw_emotion = emotion.lower()
+
+    # Start tracking candidate
+    if state["candidate_emotion"] != raw_emotion:
+        state["candidate_emotion"] = raw_emotion
+        state["candidate_start_time"] = now
+        return state.get("stable_emotion", "none"), confidence
+
+    # Check if emotion stayed long enough
+    if now - state["candidate_start_time"] >= EMOTION_HOLD_TIME_SEC:
+
+        # Prevent rapid switching
+        if now - state["last_emotion_change_time"] >= EMOTION_CHANGE_COOLDOWN:
+            state["stable_emotion"] = raw_emotion
+            state["last_emotion_change_time"] = now
+
+    return state.get("stable_emotion", raw_emotion), confidence
 
 
 async def index_handler(request):
@@ -172,10 +205,17 @@ async def ws_handler(request):
         "last_spoken_emotion": None,
         "last_emotion_speak_time": 0.0,
 
+        "last_greeting_time": 0.0,
+
         # stable emotion memory
         "emotion_history": deque(maxlen=EMOTION_HISTORY_SIZE),
-        "stable_emotion": "none"
-    }
+        "stable_emotion": "none",
+
+        # NEW (important)
+        "candidate_emotion": None,
+        "candidate_start_time": 0.0,
+        "last_emotion_change_time": 0.0
+        }
 
     print(f"Device connected: {device_id}")
 
@@ -216,6 +256,8 @@ async def ws_handler(request):
                         state["person_present"] = False
                         state["no_face_start_time"] = None
 
+                        state["last_spoken_emotion"] = None
+
                         ok = await safe_send(ws, {
                             "type": "event",
                             "event_name": "person_left",
@@ -236,12 +278,14 @@ async def ws_handler(request):
                 state["customer_selected"] = True
                 state["looking_start_time"] = None
 
-                current_emotion, confidence = get_face_emotion(frame, faces[0], state)
+                current_emotion, confidence = get_face_emotion(frame, faces[0], state, now)
                 speak_based_on_emotion(state, current_emotion, now)
 
                 if not state["person_present"]:
                     state["person_present"] = True
-                    say_text("Hi, this is Matilda")
+                    if now - state["last_greeting_time"] >= GREETING_COOLDOWN_SEC:
+                        say_text("Hi, this is Matilda. How can I help you today?")
+                        state["last_greeting_time"] = now
 
                     ok = await safe_send(ws, {
                         "type": "event",
@@ -292,7 +336,7 @@ async def ws_handler(request):
                             state["emotion_history"].clear()
                             state["stable_emotion"] = "none"
 
-                            current_emotion, confidence = get_face_emotion(frame, closest_face, state)
+                            current_emotion, confidence = get_face_emotion(frame, closest_face, state, now)
                             speak_based_on_emotion(state, current_emotion, now)
 
                             say_text("Hello, I am listening to you.")
